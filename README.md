@@ -1,5 +1,7 @@
 # Fiber CLI
 
+![Fiber mobile and desktop apps — The Stablecoin Neobank](./assets/fiber-stablecoin-neobank.png)
+
 Fiber CLI is a public recovery tool for password-encrypted Fiber `.fiberseed` exports. It can:
 
 - derive and print Fiber EVM or Solana private keys; and
