@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Public recovery code should never need a write-capable workflow token.
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUN_VERSION: 1.3.14
+
+jobs:
+  test:
+    name: Test and typecheck
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Test
+        run: bun test
+
+      - name: Typecheck
+        run: bun run typecheck
