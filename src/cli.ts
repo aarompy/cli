@@ -1,13 +1,10 @@
+import { open } from "node:fs/promises";
 import { stderr, stdout } from "node:process";
-import { HELP_TEXT, parseCliArguments } from "./arguments.ts";
+import packageJson from "../package.json" with { type: "json" };
+import { getHelpText, parseCliArguments, type PrivateKeyCommand } from "./arguments.ts";
 import { readHiddenPassword, readPasswordFromStdin } from "./password.ts";
 import type { PrivateAssetScan } from "./private-assets.ts";
-import {
-  deriveEvmPrivateKey,
-  deriveSolanaPrivateKey,
-  formatPrivateKey,
-  formatSolanaPrivateKey,
-} from "./private-key.ts";
+import { deriveKey, type DerivedKey } from "./private-key.ts";
 import { readWalletSeed } from "./wallet-file.ts";
 
 type Output = Pick<NodeJS.WriteStream, "write">;
@@ -20,6 +17,7 @@ export type CliDependencies = {
     rpcUrl: string;
     onProgress: (message: string) => void;
   }) => Promise<PrivateAssetScan>;
+  writeSecretFile: (file: string, contents: string) => Promise<void>;
   stdout: Output;
   stderr: Output;
 };
@@ -32,9 +30,82 @@ const defaultDependencies: CliDependencies = {
     const { listPrivateAssets } = await import("./private-assets.ts");
     return listPrivateAssets(input);
   },
+  writeSecretFile,
   stdout,
   stderr,
 };
+
+/**
+ * Creates a new owner-only file for recovered keys and refuses to replace an existing one.
+ * It accepts the destination path and the complete secret contents.
+ */
+export async function writeSecretFile(file: string, contents: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(file, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`--output file already exists: ${file}`);
+    }
+    throw error;
+  }
+  try {
+    await handle.writeFile(contents);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Renders recovered keys in the selected format.
+ * One text key stays a bare line for backward-compatible piping; a range becomes a table.
+ */
+export function formatKeys(keys: DerivedKey[], json: boolean): string {
+  if (json) return `${JSON.stringify(keys, null, 2)}\n`;
+  if (keys.length === 1) return `${keys[0]!.privateKey}\n`;
+
+  const rows = keys.map((key) =>
+    `${key.derivationIndex}\t${key.derivationPath}\t${key.address}\t${key.privateKey}`
+  );
+  return `INDEX\tPATH\tADDRESS\tPRIVATE_KEY\n${rows.join("\n")}\n`;
+}
+
+/** Prints recovered keys to stdout or a new file, with addresses on stderr for verification. */
+async function writePrivateKeys(
+  keys: DerivedKey[],
+  parsed: PrivateKeyCommand,
+  dependencies: CliDependencies,
+): Promise<void> {
+  const chain = parsed.chain.toUpperCase();
+  const noun = keys.length === 1 ? "private key" : "private keys";
+  const contents = formatKeys(keys, parsed.json);
+
+  // Addresses are not secret, so stderr lists them whenever stdout would not show them.
+  const writeAddresses = () => {
+    for (const key of keys) {
+      dependencies.stderr.write(`Address: ${key.address} (${key.derivationPath})\n`);
+    }
+  };
+
+  if (parsed.output !== undefined) {
+    await dependencies.writeSecretFile(parsed.output, contents);
+    dependencies.stderr.write(
+      `Wrote ${keys.length} live ${chain} ${noun} to ${parsed.output} (mode 0600). Keep it secret.\n`,
+    );
+    writeAddresses();
+    return;
+  }
+
+  if (keys.length === 1 && !parsed.json) {
+    writeAddresses();
+    dependencies.stderr.write(`WARNING: the next line is a live ${chain} private key. Keep it secret.\n`);
+  } else {
+    dependencies.stderr.write(
+      `WARNING: the output below contains ${keys.length} live ${chain} ${noun}. Keep it secret.\n`,
+    );
+  }
+  dependencies.stdout.write(contents);
+}
 
 /**
  * Writes an exhaustive private-asset scan in human-readable or stable JSON form.
@@ -68,8 +139,12 @@ export async function runCli(
 ): Promise<number> {
   try {
     const parsed = parseCliArguments(args);
-    if (parsed === "help") {
-      dependencies.stdout.write(HELP_TEXT);
+    if (parsed.command === "help") {
+      dependencies.stdout.write(getHelpText(parsed.topic));
+      return 0;
+    }
+    if (parsed.command === "version") {
+      dependencies.stdout.write(`${packageJson.version}\n`);
       return 0;
     }
 
@@ -78,20 +153,11 @@ export async function runCli(
 
     try {
       if (parsed.command === "private-key") {
-        const privateKey = parsed.chain === "solana"
-          ? deriveSolanaPrivateKey(seed, parsed.derivationIndex)
-          : deriveEvmPrivateKey(seed, parsed.derivationIndex);
-        try {
-          dependencies.stderr.write(
-            `WARNING: the next line is a live ${parsed.chain.toUpperCase()} private key. Keep it secret.\n`,
-          );
-          const formattedPrivateKey = parsed.chain === "solana"
-            ? await formatSolanaPrivateKey(privateKey)
-            : formatPrivateKey(privateKey);
-          dependencies.stdout.write(`${formattedPrivateKey}\n`);
-        } finally {
-          privateKey.fill(0);
+        const keys: DerivedKey[] = [];
+        for (const derivationIndex of parsed.derivationIndexes) {
+          keys.push(await deriveKey(seed, parsed.chain, derivationIndex));
         }
+        await writePrivateKeys(keys, parsed, dependencies);
         return 0;
       }
 

@@ -1,8 +1,12 @@
 import { getPublicKeyAsync } from "@noble/ed25519";
 import { hmac } from "@noble/hashes/hmac.js";
 import { sha512 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import { base58 } from "@scure/base";
 import { HDKey } from "@scure/bip32";
+// The transaction subpath keeps the full ethers bundle out of the private-key startup path.
+import { computeAddress } from "ethers/transaction";
+import type { FiberKeyNetwork } from "./chains.ts";
 
 const SLIP10_ED25519_MASTER_KEY = new TextEncoder().encode("ed25519 seed");
 
@@ -37,12 +41,19 @@ function deriveSlip10HardenedChild(parent: Slip10Node, index: number): Slip10Nod
   }
 }
 
+/** Returns the BIP-44 path Fiber uses for one account index on the selected key network. */
+export function getDerivationPath(chain: FiberKeyNetwork, derivationIndex: number): string {
+  return chain === "solana"
+    ? `m/44'/501'/${derivationIndex}'/0'`
+    : `m/44'/60'/0'/0/${derivationIndex}`;
+}
+
 /**
  * Derives the EVM account exactly as Fiber's enclave does for normal wallet operations.
  * It accepts decrypted master seed bytes and a non-hardened account index.
  */
 export function deriveEvmPrivateKey(seed: Uint8Array, derivationIndex: number): Uint8Array {
-  const child = HDKey.fromMasterSeed(seed).derive(`m/44'/60'/0'/0/${derivationIndex}`);
+  const child = HDKey.fromMasterSeed(seed).derive(getDerivationPath("evm", derivationIndex));
   if (!child.privateKey) throw new Error("Failed to derive the EVM private key");
   return child.privateKey.slice();
 }
@@ -74,7 +85,7 @@ export function deriveSolanaPrivateKey(seed: Uint8Array, derivationIndex: number
  */
 export function formatPrivateKey(privateKey: Uint8Array): string {
   if (privateKey.length !== 32) throw new Error("Invalid EVM private key");
-  return `0x${Buffer.from(privateKey).toString("hex")}`;
+  return `0x${bytesToHex(privateKey)}`;
 }
 
 /**
@@ -94,5 +105,51 @@ export async function formatSolanaPrivateKey(privateKey: Uint8Array): Promise<st
   } finally {
     secretKey.fill(0);
     publicKey.fill(0);
+  }
+}
+
+/** Returns the checksummed EVM address for a 32-byte private key. */
+export function formatEvmAddress(privateKey: Uint8Array): string {
+  return computeAddress(formatPrivateKey(privateKey));
+}
+
+/** Returns the base58 Solana address (the Ed25519 public key) for Fiber's 32-byte seed. */
+export async function formatSolanaAddress(privateKey: Uint8Array): Promise<string> {
+  if (privateKey.length !== 32) throw new Error("Invalid Solana private key");
+  return base58.encode(await getPublicKeyAsync(privateKey));
+}
+
+export type DerivedKey = {
+  chain: FiberKeyNetwork;
+  derivationIndex: number;
+  derivationPath: string;
+  address: string;
+  privateKey: string;
+};
+
+/**
+ * Derives and formats one recovery key with the address it controls.
+ * It accepts the decrypted master seed and clears the raw key bytes before returning.
+ */
+export async function deriveKey(
+  seed: Uint8Array,
+  chain: FiberKeyNetwork,
+  derivationIndex: number,
+): Promise<DerivedKey> {
+  const privateKey = chain === "solana"
+    ? deriveSolanaPrivateKey(seed, derivationIndex)
+    : deriveEvmPrivateKey(seed, derivationIndex);
+  try {
+    return {
+      chain,
+      derivationIndex,
+      derivationPath: getDerivationPath(chain, derivationIndex),
+      address: chain === "solana" ? await formatSolanaAddress(privateKey) : formatEvmAddress(privateKey),
+      privateKey: chain === "solana"
+        ? await formatSolanaPrivateKey(privateKey)
+        : formatPrivateKey(privateKey),
+    };
+  } finally {
+    privateKey.fill(0);
   }
 }

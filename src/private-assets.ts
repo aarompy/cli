@@ -1,11 +1,15 @@
 import { randomBytes } from "node:crypto";
 import {
+  EngineEvent,
+  MerkletreeScanStatus,
   PollingJsonRpcProvider,
   RailgunEngine,
   TokenType,
   TXIDVersion,
   WalletBalanceBucket,
+  type MerkletreeHistoryScanEventData,
   type TokenBalancesAllTxidVersions,
+  type UTXOScanDecryptBalancesCompleteEventData,
 } from "@railgun-community/engine";
 import { NETWORK_CONFIG, type Network } from "@railgun-community/shared-models";
 import { entropyToMnemonic } from "@scure/bip39";
@@ -31,6 +35,9 @@ const TOKEN_TYPE_NAMES: Record<TokenType, PrivateAsset["type"]> = {
   [TokenType.ERC721]: "ERC721",
   [TokenType.ERC1155]: "ERC1155",
 };
+
+/** Marks a scan that could not read the pool's full history, so balances are unknown. */
+class IncompletePrivateAssetScanError extends Error {}
 
 /**
  * Validates an explicit HTTP RPC URL before any wallet material is decrypted or scanned.
@@ -79,8 +86,8 @@ export async function getRpcChainId(rpcUrl: string): Promise<number> {
 }
 
 /**
- * Finds a current Railgun deployment for the RPC-reported EVM chain.
- * It accepts a positive chain ID and excludes deprecated or empty deployments.
+ * Combines SDK chain capabilities with Fiber's deployment for read-only recovery.
+ * It accepts the RPC-reported chain ID and excludes deprecated or empty SDK networks.
  */
 export function getRailgunNetwork(chainId: number): Network {
   const fiberChain = getFiberEvmChain(chainId);
@@ -101,12 +108,13 @@ export function getRailgunNetwork(chainId: number): Network {
 
   const fiberDeployment = getFiberPrivateDeployment(chainId);
   if (!fiberDeployment) return network;
-  if (network.proxyContract.toLowerCase() !== fiberDeployment.proxy.toLowerCase()) {
-    throw new Error(`Railgun deployment metadata does not match Fiber chain ${chainId}`);
-  }
 
-  // Start from Fiber's original proxy deployment so recovery cannot miss older commitments.
-  return { ...network, deploymentBlock: fiberDeployment.deploymentBlock };
+  // The SDK still lists upstream Arbitrum. Read Fiber's proxy and full history instead.
+  return {
+    ...network,
+    proxyContract: fiberDeployment.proxy,
+    deploymentBlock: fiberDeployment.deploymentBlock,
+  };
 }
 
 /**
@@ -228,14 +236,44 @@ export async function listPrivateAssets({
       0,
       creationBlockNumbers,
     );
+
+    // The engine reports a failed history scan only as an event and then returns normally.
+    // Without these checks, an RPC that refuses old logs would read as an empty wallet.
+    const completedVersions = new Set<TXIDVersion>();
+    let scanIncomplete = false;
+    engine.on(
+      EngineEvent.UTXOScanDecryptBalancesComplete,
+      ({ txidVersion, chain }: UTXOScanDecryptBalancesCompleteEventData) => {
+        if (chain.id === chainId) completedVersions.add(txidVersion);
+      },
+    );
+    engine.on(
+      EngineEvent.UTXOMerkletreeHistoryScanUpdate,
+      ({ scanStatus, chain }: MerkletreeHistoryScanEventData) => {
+        if (chain.id === chainId && scanStatus === MerkletreeScanStatus.Incomplete) {
+          scanIncomplete = true;
+        }
+      },
+    );
     await engine.scanContractHistory(network.chain, [wallet.id]);
+
+    const scannedVersions = network.supportsV3
+      ? [TXIDVersion.V2_PoseidonMerkle, TXIDVersion.V3_PoseidonMerkle]
+      : [TXIDVersion.V2_PoseidonMerkle];
+    if (scanIncomplete || scannedVersions.some((version) => !completedVersions.has(version))) {
+      throw new IncompletePrivateAssetScanError(
+        `Private asset scan on ${network.publicName} stopped before reading the pool's full history, so no balances are shown. ` +
+          "Use an RPC that serves eth_getLogs for 5,000-block ranges back to the pool's deployment; many free public RPCs refuse this.",
+      );
+    }
 
     const balances = await wallet.getTokenBalancesAllTxidVersions(
       network.chain,
       [WalletBalanceBucket.Spendable],
     );
     return { chainId, network: network.publicName, assets: aggregatePrivateAssets(balances) };
-  } catch {
+  } catch (error) {
+    if (error instanceof IncompletePrivateAssetScanError) throw error;
     throw new Error(
       `Private asset scan failed on ${network.publicName}; verify the supplied RPC and try again`,
     );

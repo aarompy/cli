@@ -27,26 +27,56 @@ You need the `.fiberseed` file downloaded from the Fiber profile page and the pa
 Use the hidden password prompt. EVM is the backward-compatible default:
 
 ```bash
-bun src/index.ts private-key --file ./fiber-wallet-backup-2026-08-31.fiberseed
+bun src/index.ts private-key --file ./fiber-wallet-backup-2026-08-31.fiberseed --derivation-index 1
 ```
 
-The default account uses the same derivation path as Fiber's enclave: `m/44'/60'/0'/0/0`. To recover another Fiber derivation index:
+EVM keys use the same derivation path as Fiber's enclave, `m/44'/60'/0'/0/<index>`. Fiber gives each deposit and routing address its own index, starting at 1. Fiber never uses index 0, the CLI's default, so pass the index you need. If you don't know it, derive a range and look for your address in the output (see [Several accounts at once](#several-accounts-at-once)).
+
+All Fiber EVM networks use this same key derivation: Ethereum, BNB Smart Chain, Robinhood Chain, Polygon, Base, Arbitrum, Unichain, Monad, Arc, HyperEVM, Plasma, and Sepolia.
+
+For a Phantom-compatible Solana key, add `--chain solana`:
 
 ```bash
-bun src/index.ts private-key --file ./backup.fiberseed --derivation-index 1
+bun src/index.ts private-key --file ./backup.fiberseed --chain solana --derivation-index 2
 ```
 
-All Fiber EVM networks use this same key derivation. This covers Ethereum, Polygon, Base, Arbitrum, Unichain, and Sepolia.
-
-For Fiber's Phantom-compatible Solana key at `m/44'/501'/0'/0'`:
-
-```bash
-bun src/index.ts private-key --file ./backup.fiberseed --chain solana
-```
-
-Add `--derivation-index <index>` to recover another Solana account with the same backend-compatible path.
+Solana keys use Fiber's backend path, `m/44'/501'/<index>'/0'`. Fiber numbers its EVM and Solana addresses in one shared sequence, so a Solana address can have any index from 1 up.
 
 EVM output is a `0x`-prefixed 32-byte private key. Solana output is the standard base58 64-byte secret key accepted by wallet importers. The output is a live secret. Do not paste it into chat, logs, tickets, command arguments, or shell history.
+
+For a single key, standard output contains only the key, so existing pipes keep working. The address it controls and its derivation path go to standard error, so you can confirm you have the right account before importing it:
+
+```text
+Address: 0x0c6a5255BAd8Cf881B5055e9523d41D8772cB898 (m/44'/60'/0'/0/1)
+WARNING: the next line is a live EVM private key. Keep it secret.
+0x…
+```
+
+### Several accounts at once
+
+Pass an inclusive range to derive up to 100 accounts with one password entry. This is the quickest way to find the index of an address, such as a deposit address you sent funds to:
+
+```bash
+bun src/index.ts private-key --file ./backup.fiberseed --derivation-index 1-20
+```
+
+A range prints a tab-separated table with the columns `INDEX`, `PATH`, `ADDRESS`, and `PRIVATE_KEY`. To see only the addresses on screen, add `--output <file>` as shown below. The keys go to that file, and the addresses still print.
+
+### JSON and file output
+
+Add `--json` to get an array of `{chain, derivationIndex, derivationPath, address, privateKey}` objects, whether you ask for one key or a range.
+
+Add `--output <file>` to keep keys out of the terminal. The CLI creates a new file with owner-only `0600` permissions and refuses to overwrite one that already exists. Addresses are still printed to standard error so you can check them. Delete the file once you have imported the keys.
+
+```bash
+bun src/index.ts private-key \
+  --file ./backup.fiberseed \
+  --derivation-index 1-20 \
+  --json \
+  --output ./recovered-keys.json
+```
+
+Options also accept the `--flag=value` form. Run `bun src/index.ts private-key --help` for the full option list and derivation paths, and `bun src/index.ts --version` to print the CLI version.
 
 For non-interactive use, pipe exactly one password line. `--password-stdin` is safer than putting the password in the process arguments:
 
@@ -68,16 +98,24 @@ bun src/index.ts private-assets \
 
 There is intentionally no default RPC URL. The CLI does not read one from an environment variable and does not fall back to a public provider. It detects the chain with `eth_chainId`, verifies that Railgun supports it, then scans from that network's deployment block through the supplied RPC only. A first scan can take time. The result is only as trustworthy as the RPC, so use a provider you trust.
 
-Run the command once with the RPC for each chain you need to inspect. Railgun private pools compatible with the Fiber seed are available on Ethereum, Polygon, Base, Arbitrum, and Sepolia. Unichain and Solana are supported by the backend for public assets and key recovery, but they do not have compatible private pools to scan.
+The RPC must answer `eth_getLogs` for 5,000-block ranges all the way back to the pool's deployment block. Many free public RPCs refuse these historical queries. If the RPC can't serve the full history, the scan stops with an error rather than showing incomplete balances.
+
+Run the command once with the RPC for each chain you need to inspect. Fiber's own private pools are on Ethereum, BNB Smart Chain, Base, Arbitrum, and Sepolia, and the CLI scans each one from the block where Fiber deployed it. On Polygon it scans Railgun's own pool, which the same seed can also hold assets in. The other networks have no private pool to scan. Recover funds there with `private-key`.
 
 | Backend chain | Chain ID | Private-key recovery | Private-asset scan |
 | --- | ---: | --- | --- |
-| Ethereum | 1 | EVM | Yes |
-| Polygon | 137 | EVM | Yes |
-| Base | 8453 | EVM | Yes |
-| Arbitrum | 42161 | EVM | Yes |
+| Ethereum | 1 | EVM | Fiber's pool |
+| BNB Smart Chain | 56 | EVM | Fiber's pool |
+| Robinhood Chain | 4663 | EVM | No private pool |
+| Polygon | 137 | EVM | Railgun's pool |
+| Base | 8453 | EVM | Fiber's pool |
+| Arbitrum | 42161 | EVM | Fiber's pool |
 | Unichain | 130 | EVM | No private pool |
-| Sepolia | 11155111 | EVM | Yes |
+| Monad | 143 | EVM | No private pool |
+| Arc | 5042 | EVM | No private pool |
+| HyperEVM | 999 | EVM | No private pool |
+| Plasma | 9745 | EVM | No private pool |
+| Sepolia | 11155111 | EVM | Fiber's pool |
 | Solana | 101 | Solana | No private pool |
 
 The text output includes the token type, contract address, NFT token ID when applicable, and raw integer amount. Raw ERC-20 amounts are not adjusted for decimals.
