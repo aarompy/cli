@@ -15,6 +15,8 @@ export type FakeRpcOptions = {
   logDelayMs?: number;
   /** Blocks that contain one synthetic log each. */
   logBlocks?: number[];
+  /** Answers eth_simulateV1; without it the method is unsupported, as on many RPCs. */
+  simulateV1?: (params: unknown[]) => unknown;
 };
 
 export type FakeRpcRequest = { method: string; params: unknown[] };
@@ -45,6 +47,9 @@ export function startFakeRpc(options: FakeRpcOptions) {
         return result(String(options.chainId));
       case "eth_blockNumber":
         return result(hex(options.latestBlock));
+      case "eth_simulateV1":
+        if (!options.simulateV1) return error(-32601, "the method eth_simulateV1 does not exist");
+        return result(options.simulateV1(params));
       case "eth_call":
         // The engine's only call here is rootHistory(tree, root); answer true so roots validate.
         return result(word(1));

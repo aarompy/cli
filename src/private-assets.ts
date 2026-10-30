@@ -7,6 +7,7 @@ import {
   TXIDVersion,
   WalletBalanceBucket,
   type MerkletreeHistoryScanEventData,
+  type RailgunWallet,
   type TokenBalancesAllTxidVersions,
   type UTXOScanDecryptBalancesCompleteEventData,
 } from "@railgun-community/engine";
@@ -154,6 +155,30 @@ export function aggregatePrivateAssets(
   );
 }
 
+export type ArtifactGetter = Parameters<typeof RailgunEngine.initForWallet>[2];
+
+const unavailableArtifacts = {
+  assertArtifactExists: () => undefined,
+  getArtifacts: async () => {
+    throw new Error("Proof artifacts are not available in the read-only Fiber CLI");
+  },
+  getArtifactsPOI: async () => {
+    throw new Error("POI proof artifacts are not available in the read-only Fiber CLI");
+  },
+} as unknown as ArtifactGetter;
+
+/** A fully scanned in-memory Railgun wallet. close() unloads the engine and clears the session key. */
+export type RailgunWalletSession = {
+  chainId: number;
+  network: Network;
+  engine: RailgunEngine;
+  wallet: RailgunWallet;
+  provider: LogRangeProvider;
+  /** Random per-session key that encrypts the in-memory wallet database. */
+  encryptionKey: string;
+  close: () => Promise<void>;
+};
+
 /**
  * Says why a history scan stopped: an RPC that rejects the block range needs a smaller --chunk,
  * while one that answers recent blocks but refuses old ones keeps no history, and --chunk cannot help.
@@ -194,44 +219,45 @@ async function explainIncompleteScan(
 }
 
 /**
- * Reconstructs Fiber's Railgun wallet and scans private holdings through one explicit RPC.
- * It accepts decrypted seed bytes, the RPC URL, an optional eth_getLogs block span, and an
- * optional progress sink for stderr.
+ * Reconstructs Fiber's Railgun wallet and scans its full history through one explicit RPC.
+ * It accepts decrypted seed bytes, the RPC URL, an optional eth_getLogs block span, a progress
+ * sink, and a proof-artifact source (read-only by default). It throws when the scan cannot read
+ * the pool's full history. Callers must call close() on the returned session.
  */
-export async function listPrivateAssets({
+export async function openRailgunWallet({
   seed,
   rpcUrl,
   chunkSize,
   onProgress = () => undefined,
+  artifactGetter = unavailableArtifacts,
+  onEngineReady = () => undefined,
 }: {
   seed: Uint8Array;
   rpcUrl: string;
   chunkSize?: number;
   onProgress?: (message: string) => void;
-}): Promise<PrivateAssetScan> {
+  artifactGetter?: ArtifactGetter;
+  /** Runs after engine creation and before the scan, for example to attach a prover. */
+  onEngineReady?: (engine: RailgunEngine) => void;
+}): Promise<RailgunWalletSession> {
   const chainId = await getRpcChainId(rpcUrl);
   const network = getRailgunNetwork(chainId);
   const encryptionKeyBytes = randomBytes(32);
   let engine: RailgunEngine | undefined;
   let provider: LogRangeProvider | undefined;
+  const close = async () => {
+    encryptionKeyBytes.fill(0);
+    if (engine) await engine.unload().catch(() => undefined);
+    provider?.destroy();
+  };
 
   try {
-    const unavailableArtifacts = {
-      assertArtifactExists: () => undefined,
-      getArtifacts: async () => {
-        throw new Error("Proof artifacts are not available in the read-only Fiber CLI");
-      },
-      getArtifactsPOI: async () => {
-        throw new Error("POI proof artifacts are not available in the read-only Fiber CLI");
-      },
-    } as unknown as Parameters<typeof RailgunEngine.initForWallet>[2];
-
     // Empty quick-sync callbacks keep recovery traffic on the user-supplied RPC.
     engine = await RailgunEngine.initForWallet(
       "fibercli",
       // Recovery state stays in this process and never touches the filesystem.
       memdown(),
-      unavailableArtifacts,
+      artifactGetter,
       async () => ({ commitmentEvents: [], unshieldEvents: [], nullifierEvents: [] }),
       async () => [],
       async () => true,
@@ -239,6 +265,7 @@ export async function listPrivateAssets({
       undefined,
       false,
     );
+    onEngineReady(engine);
 
     onProgress(`Scanning ${network.publicName} through the supplied RPC; the first scan can take time...`);
     // Free RPCs often cap eth_getLogs ranges and rate-limit requests; this provider splits and retries.
@@ -277,12 +304,13 @@ export async function listPrivateAssets({
     creationBlockNumbers[network.chain.type] ??= [];
     creationBlockNumbers[network.chain.type][network.chain.id] = network.deploymentBlock;
 
-    const wallet = await engine.createWalletFromMnemonic(
-      encryptionKeyBytes.toString("hex"),
+    const encryptionKey = encryptionKeyBytes.toString("hex");
+    const wallet = (await engine.createWalletFromMnemonic(
+      encryptionKey,
       mnemonic,
       0,
       creationBlockNumbers,
-    );
+    )) as RailgunWallet;
 
     // The engine reports a failed history scan only as an event and then returns normally.
     // Without these checks, an RPC that refuses old logs would read as an empty wallet.
@@ -314,19 +342,39 @@ export async function listPrivateAssets({
       );
     }
 
-    const balances = await wallet.getTokenBalancesAllTxidVersions(
-      network.chain,
-      [WalletBalanceBucket.Spendable],
-    );
-    return { chainId, network: network.publicName, assets: aggregatePrivateAssets(balances) };
+    return { chainId, network, engine, wallet, provider, encryptionKey, close };
   } catch (error) {
+    await close();
     if (error instanceof IncompletePrivateAssetScanError) throw error;
     throw new Error(
       `Private asset scan failed on ${network.publicName}; verify the supplied RPC and try again`,
     );
+  }
+}
+
+/**
+ * Reconstructs Fiber's Railgun wallet and scans private holdings through one explicit RPC.
+ * It accepts decrypted seed bytes, the RPC URL, an optional eth_getLogs block span, and an
+ * optional progress sink for stderr.
+ */
+export async function listPrivateAssets(input: {
+  seed: Uint8Array;
+  rpcUrl: string;
+  chunkSize?: number;
+  onProgress?: (message: string) => void;
+}): Promise<PrivateAssetScan> {
+  const session = await openRailgunWallet(input);
+  try {
+    const balances = await session.wallet.getTokenBalancesAllTxidVersions(
+      session.network.chain,
+      [WalletBalanceBucket.Spendable],
+    );
+    return {
+      chainId: session.chainId,
+      network: session.network.publicName,
+      assets: aggregatePrivateAssets(balances),
+    };
   } finally {
-    encryptionKeyBytes.fill(0);
-    if (engine) await engine.unload().catch(() => undefined);
-    provider?.destroy();
+    await session.close();
   }
 }

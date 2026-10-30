@@ -37,6 +37,10 @@ const RETRYABLE_PATTERN =
   /rate.?limit|too many requests|throttl|over capacity|exceeded .*(quota|capacity|compute units)|temporarily unavailable|timeout|timed out|\b(429|502|503|504|-32005|-32029|-32090)\b/i;
 const HEX_QUANTITY = /^0x[0-9a-f]+$/i;
 
+/** RPC methods that sign or send. The scan provider is read-only and refuses them. */
+export const SIGNING_METHODS =
+  /^(eth_sendTransaction|eth_sendRawTransaction|eth_sign|eth_signTransaction|eth_signTypedData.*|personal_sign|wallet_.*)$/;
+
 function describeError(error: unknown): string {
   if (!error || typeof error !== "object") return String(error);
   const fields = error as { code?: unknown; message?: unknown; shortMessage?: unknown; info?: { responseStatus?: unknown }; error?: { code?: unknown; message?: unknown } };
@@ -97,7 +101,8 @@ class RpcResponseError extends Error {
  * Railgun scan provider for RPCs that cap eth_getLogs ranges or rate-limit requests.
  * It splits every numeric eth_getLogs query into spans of at most maxBlockRange blocks, halves the
  * span when the RPC still reports a range limit, and retries rate limits with exponential backoff.
- * Other methods are forwarded unchanged apart from the same retry policy.
+ * Other methods are forwarded unchanged apart from the same retry policy, except signing and
+ * sending methods, which are refused.
  *
  * Spans are cached in memory, including ones still in flight. The engine abandons a 5,000-block
  * query after 10 seconds and repeats it; on a slow or throttled RPC the split query needs longer,
@@ -139,6 +144,8 @@ export class LogRangeProvider extends PollingJsonRpcProvider {
 
   override async _send(payload: JsonRpcPayload | JsonRpcPayload[]): Promise<JsonRpcResult[]> {
     const payloads = Array.isArray(payload) ? payload : [payload];
+    const signing = payloads.find((single) => SIGNING_METHODS.test(single.method));
+    if (signing) throw new Error(`BLOCKED: ${signing.method} is not allowed on the read-only scan provider`);
     const responses = await Promise.all(payloads.map((single) => this.#sendOne(single)));
     // ethers reads JSON-RPC errors from the same array even though its type only names results.
     return responses as JsonRpcResult[];
